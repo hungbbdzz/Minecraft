@@ -1,6 +1,7 @@
 import json
 import re
 import os
+from collections import Counter
 
 # ============================================================
 # WHITELIST - chỉ lấy item từ các mod thực sự có EMC value
@@ -51,6 +52,90 @@ ITEM_BLACKLIST_PATTERNS = [
     r"_hit$",                    # sound events
     r"projectile$",              # warlus shot entities
 ]
+
+ITEM_ID_PATTERN = re.compile(r'\b([a-z][a-z0-9_]*:[a-z][a-z0-9_]*)\b')
+ITEM_BLACKLIST_REGEXES = [re.compile(pattern) for pattern in ITEM_BLACKLIST_PATTERNS]
+LOG_FILE_CANDIDATES = (
+    "ListOfItemLackEMC.txt",
+    "listofitemlackemc.txt",
+    "ListOfItemsLackEMC.txt",
+)
+
+BASE_MATERIAL_VALUES = [
+    ("netherite", 65536),
+    ("diamond", 8192),
+    ("emerald", 16384),
+    ("amethyst", 4096),
+    ("gold", 2048),
+    ("iron", 256),
+    ("copper", 128),
+    ("coal", 128),
+    ("quartz", 256),
+    ("lapis", 1024),
+    ("redstone", 64),
+    ("obsidian", 64),
+    ("blaze", 1536),
+    ("prismarine", 256),
+    ("slime", 64),
+]
+
+
+PRECIOUS_TOKENS = (
+    "netherite", "diamond", "emerald", "draconium", "chaos", "dragon",
+    "wither", "artifact", "relic", "legendary", "ancient", "mythic",
+)
+
+TRIVIAL_BUILDING_TOKENS = (
+    "stone", "cobble", "dirt", "sand", "gravel", "netherrack", "deepslate",
+    "andesite", "diorite", "granite", "tuff", "basalt", "limestone",
+    "slate", "shale", "marble", "brick", "bricks", "plank", "wood", "log",
+    "stairs", "slab", "wall", "fence", "fence_gate", "trapdoor", "door",
+    "button", "pressure_plate", "pane", "glass", "carpet", "wool", "leaf",
+    "leaves", "sapling", "terracotta", "concrete", "mud", "clay",
+)
+
+RARE_KEYWORD_VALUES = [
+    ("chaotic", 131072),
+    ("awakened", 65536),
+    ("draconic", 32768),
+    ("dragon", 16384),
+    ("wither", 8192),
+    ("gauntlet", 8192),
+    ("boss", 8192),
+    ("artifact", 4096),
+    ("relic", 4096),
+    ("legendary", 4096),
+    ("mythic", 4096),
+]
+
+
+RARITY_MOD_WEIGHTS = {
+    "draconicevolution": 6,
+    "cataclysm": 5,
+    "iceandfire": 4,
+    "duneons": 3,
+    "mysticalagriculture": 2,
+    "ars_nouveau": 2,
+    "evilcraft": 2,
+    "appliedenergistics2": 1,
+    "ae2": 1,
+    "industrialforegoing": 1,
+}
+
+VERY_RARE_KEYWORDS = (
+    "chaotic", "awakened", "draconic", "netherite", "dragon", "wither",
+    "artifact", "relic", "mythic", "legendary", "ancient", "gauntlet",
+)
+
+RARE_KEYWORDS = (
+    "core", "heart", "soul", "essence", "shard", "gem", "crystal",
+    "orb", "sigil", "eye", "crown", "totem", "rune", "altar",
+)
+
+UNCOMMON_KEYWORDS = (
+    "ingot", "plate", "gear", "dust", "rod", "nugget", "fragment",
+    "powder", "machine", "generator", "cell", "storage",
+)
 
 # ============================================================
 # HARDCODED EMC - giá trị cụ thể cho items quan trọng
@@ -118,8 +203,8 @@ def is_valid_item(item_id: str) -> bool:
         return False
 
     # Lọc theo blacklist patterns
-    for pattern in ITEM_BLACKLIST_PATTERNS:
-        if re.search(pattern, item_id):
+    for pattern in ITEM_BLACKLIST_REGEXES:
+        if pattern.search(item_id):
             return False
 
     # Loại bỏ tên quá ngắn (< 2 ký tự) hoặc chỉ có số
@@ -127,6 +212,111 @@ def is_valid_item(item_id: str) -> bool:
         return False
 
     return True
+
+
+def material_base_value(name: str):
+    for token, value in BASE_MATERIAL_VALUES:
+        if token in name:
+            return value
+    if "ender" in name or "enderman" in name:
+        return 1024
+    if "nether" in name:
+        return 512
+    return None
+
+
+def has_precious_token(name: str) -> bool:
+    return any(token in name for token in PRECIOUS_TOKENS)
+
+
+def trivial_block_emc(name: str):
+    if has_precious_token(name):
+        return None
+    if any(token in name for token in TRIVIAL_BUILDING_TOKENS):
+        if any(token in name for token in ("stairs", "slab", "wall", "fence", "door", "trapdoor", "pane")):
+            return 8
+        if any(token in name for token in ("leaf", "leaves", "sapling", "flower", "plant")):
+            return 12
+        return 2
+    return None
+
+
+def rare_keyword_floor(name: str):
+    for token, emc in RARE_KEYWORD_VALUES:
+        if token in name:
+            return emc
+    return None
+
+
+def resolve_log_file() -> str:
+    for candidate in LOG_FILE_CANDIDATES:
+        if os.path.exists(candidate):
+            return candidate
+    return LOG_FILE_CANDIDATES[0]
+
+
+def build_item_rarity_profile(item_id: str) -> dict:
+    mod, name = item_id.lower().split(":", 1)
+    score = RARITY_MOD_WEIGHTS.get(mod, 0)
+
+    if any(token in name for token in VERY_RARE_KEYWORDS):
+        score += 6
+    if any(token in name for token in RARE_KEYWORDS):
+        score += 3
+    if any(token in name for token in UNCOMMON_KEYWORDS):
+        score += 1
+
+    if any(token in name for token in TRIVIAL_BUILDING_TOKENS):
+        score -= 4
+
+    if any(token in name for token in ("ore", "block", "core", "heart", "artifact", "relic")):
+        score += 1
+
+    if score <= -2:
+        tier = "trivial"
+        multiplier = 0.4
+        minimum = 1
+    elif score <= 1:
+        tier = "common"
+        multiplier = 0.85
+        minimum = 8
+    elif score <= 5:
+        tier = "uncommon"
+        multiplier = 1.0
+        minimum = 64
+    elif score <= 9:
+        tier = "rare"
+        multiplier = 1.35
+        minimum = 512
+    elif score <= 13:
+        tier = "epic"
+        multiplier = 1.8
+        minimum = 2048
+    else:
+        tier = "legendary"
+        multiplier = 2.4
+        minimum = 8192
+
+    return {"tier": tier, "score": score, "multiplier": multiplier, "minimum": minimum}
+
+
+def adjust_emc_with_rarity(item_id: str, emc: int, profile: dict) -> int:
+    if item_id in HARDCODED_EMC or not profile:
+        return emc
+
+    _, name = item_id.lower().split(":", 1)
+
+    # Không hạ EMC của item quý đã có giá cao
+    if has_precious_token(name) and emc >= 4096:
+        return emc
+
+    adjusted = int(emc * profile["multiplier"])
+    adjusted = max(adjusted, profile["minimum"])
+
+    if profile["tier"] == "trivial":
+        adjusted = min(adjusted, 24)
+
+    return max(1, adjusted)
 
 
 # ============================================================
@@ -141,7 +331,15 @@ def balance_emc(item_id: str) -> int:
     if item_id in HARDCODED_EMC:
         return HARDCODED_EMC[item_id]
 
-    name = item_id.lower().split(":", 1)[1]
+    mod, name = item_id.lower().split(":", 1)
+
+    cheap_block_emc = trivial_block_emc(name)
+    if cheap_block_emc is not None:
+        return cheap_block_emc
+
+    rare_floor = rare_keyword_floor(name)
+    if rare_floor is not None and ("ore" in name or "ingot" in name or "gem" in name or "core" in name or "heart" in name):
+        return rare_floor
 
     # ----- Mystic Agriculture: essence & seeds -----
     if "essence" in name:
@@ -180,24 +378,7 @@ def balance_emc(item_id: str) -> int:
         return 1800  # seeds không rõ
 
     # ----- Vật liệu quý (kiểm tra trước hình thái) -----
-    if "netherite" in name:  base = 65536
-    elif "diamond" in name:  base = 8192
-    elif "emerald" in name:  base = 16384
-    elif "amethyst" in name: base = 4096
-    elif "gold" in name:     base = 2048
-    elif "iron" in name:     base = 256
-    elif "copper" in name:   base = 128
-    elif "coal" in name:     base = 128
-    elif "quartz" in name:   base = 256
-    elif "lapis" in name:    base = 1024
-    elif "redstone" in name: base = 64
-    elif "obsidian" in name: base = 64
-    elif "blaze" in name:    base = 1536
-    elif "ender" in name or "enderman" in name: base = 1024
-    elif "nether" in name:   base = 512
-    elif "prismarine" in name: base = 256
-    elif "slime" in name:    base = 64
-    else:                    base = None  # không rõ vật liệu
+    base = material_base_value(name)
 
     # ----- Hình thái item -----
     if "ore" in name:
@@ -265,33 +446,33 @@ def balance_emc(item_id: str) -> int:
         return base or 1024
 
     # ----- Mob drops / Combat items -----
-    if "scale" in name or "claw" in name or "fang" in name or \
-       "horn" in name or "feather" in name or "bone" in name:
-        return base or 256
+    if "dragon" in name:
+        return (base or 4096) * 2
+
+    if "wither" in name:
+        return (base or 2048) * 2
 
     if "fire" in name and "scale" in name:
         return 1024
 
+    if "eye" in name or "heart" in name:
+        return base or 1024
+
     if "scale" in name:
         return base or 512
+
+    if "tooth" in name or "tusk" in name or "fang" in name:
+        return base or 512
+
+    if "scale" in name or "claw" in name or "fang" in name or \
+       "horn" in name or "feather" in name or "bone" in name:
+        return base or 256
 
     if "meal" in name or "meat" in name:
         return base or 64
 
     if "shell" in name:
         return base or 256
-
-    if "tooth" in name or "tusk" in name or "fang" in name:
-        return base or 512
-
-    if "eye" in name or "heart" in name:
-        return base or 1024
-
-    if "dragon" in name:
-        return (base or 4096) * 2
-
-    if "wither" in name:
-        return (base or 2048) * 2
 
     if "void" in name or "chaos" in name:
         return 16384
@@ -406,6 +587,11 @@ def balance_emc(item_id: str) -> int:
         if "block" in name: return 4096 * 9
         return 4096
 
+    # ----- Mod khó / boss-heavy: tăng sàn EMC nhẹ -----
+    if mod in {"iceandfire", "cataclysm", "duneons", "draconicevolution"}:
+        if any(x in name for x in ("essence", "shard", "core", "heart", "claw", "fang", "scale", "eye")):
+            return max(base or 1024, 1024)
+
     # ----- Mặc định theo độ phức tạp tên -----
     # Tên càng dài/phức tạp = item modded thường có giá trị nhất định
     word_count = len(name.split('_'))
@@ -424,22 +610,24 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
     missing_items = set()
-    log_file = "ListOfItemLackEMC.txt"
+    log_file = resolve_log_file()
     json_file = "custom_emc.json"
+    rarity_profiles = {}
 
     # ── 1. Đọc file log và trích xuất item IDs ────────────────
     if os.path.exists(log_file):
         with open(log_file, "r", encoding="utf-8") as f:
             for line in f:
                 # Regex: chỉ lấy pattern modid:item_name (chữ thường, gạch dưới)
-                matches = re.findall(r'\b([a-z][a-z0-9_]*:[a-z][a-z0-9_]*)\b', line)
+                matches = ITEM_ID_PATTERN.findall(line)
                 for match in matches:
                     if is_valid_item(match):
                         missing_items.add(match)
 
+        print(f"✔ Đọc log từ: {log_file}")
         print(f"✔ Tìm thấy {len(missing_items)} items hợp lệ trong file log.")
     else:
-        print(f"✘ Không tìm thấy file {log_file}.")
+        print(f"✘ Không tìm thấy file log thiếu EMC. Đã tìm: {LOG_FILE_CANDIDATES}")
         return
 
     # ── 2. Đọc custom_emc.json hiện tại ────────────────
@@ -455,10 +643,16 @@ def main():
     # ── 3. Thêm EMC cho item mới + override HARDCODED ────────
     # Đảm bảo tất cả HARDCODED items đều có trong danh sách
     missing_items.update(HARDCODED_EMC.keys())
+    for item in missing_items:
+        rarity_profiles[item] = build_item_rarity_profile(item)
+
     added = 0
     updated = 0
+    tier_counter = Counter(profile["tier"] for profile in rarity_profiles.values())
+
     for item in sorted(missing_items):
         emc = balance_emc(item)
+        emc = adjust_emc_with_rarity(item, emc, rarity_profiles.get(item))
         if item not in existing_entries:
             existing_entries[item] = emc
             added += 1
@@ -487,8 +681,11 @@ def main():
     print(f"✔ Tổng cộng {len(data['entries'])} items.")
     print(f"⚡ Vào game gõ: /projecte reloadEmc")
 
+    print("\n🎯 Phân loại độ hiếm từ danh sách thiếu EMC:")
+    for tier, cnt in tier_counter.most_common():
+        print(f"   {tier}: {cnt} items")
+
     # ── 5. Thống kê theo mod ──────────────────────────────
-    from collections import Counter
     mod_counts = Counter(e["id"].split(":")[0] for e in data["entries"])
     print("\n📊 Thống kê theo mod:")
     for mod, cnt in mod_counts.most_common():
